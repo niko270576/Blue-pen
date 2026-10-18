@@ -1,0 +1,32 @@
+@echo off
+rem Builds BluePen.exe from blue_pen.py. Put this file in the same folder as blue_pen.py and double-click it.
+cd /d "%~dp0"
+
+if not exist "blue_pen.py" (
+  echo blue_pen.py was not found next to this file.
+  echo Put both files in the same folder and try again.
+  pause
+  exit /b 1
+)
+
+where python >nul 2>&1
+if errorlevel 1 (
+  echo Python is not installed.
+  echo Download it from https://www.python.org/downloads/
+  echo During setup, tick "Add python.exe to PATH".
+  pause
+  exit /b 1
+)
+
+echo Building BluePen.exe, this takes 1-2 minutes...
+python blue_pen.py --compile
+
+if exist "dist\BluePen.exe" (
+  echo.
+  echo Done: dist\BluePen.exe
+  explorer dist
+) else (
+  echo.
+  echo The build failed. Read the messages above.
+)
+pause
