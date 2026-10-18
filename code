@@ -1,0 +1,1313 @@
+"""
+Blue Pen (Windows)
+
+What each tab really does:
+  PC Game     - copies a game to a USB/external drive with a launcher that works,
+                detects the game engine and applies that engine's real graphics options.
+                Can also add a Linux launcher (.sh) that runs the game with Wine / Proton.
+  Console     - puts a console game (your own dump) on the USB together with a portable
+                emulator (DuckStation, PCSX2, RPCS3, Xenia) and a launcher, so it plays on any PC.
+  Bootable    - turns a USB stick into a real UEFI-bootable stick from an ISO
+                (Windows / Linux installers). ERASES the stick.
+  Burn Disc   - checks whether an ISO is bootable and opens the Windows disc burner.
+"""
+import ctypes
+import json
+import os
+import queue
+import shutil
+import string
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+IS_WINDOWS = os.name == "nt"
+FAT32_MAX_FILE = 4 * 1024**3 - 1
+CHUNK = 4 * 1024 * 1024
+NO_WINDOW = 0x08000000 if IS_WINDOWS else 0  # CREATE_NO_WINDOW
+
+# ============================================================== system helpers
+
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    if getattr(sys, "frozen", False):
+        exe, params = sys.executable, ""
+    else:
+        exe, params = sys.executable, f'"{os.path.abspath(__file__)}"'
+    return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1) > 32
+
+
+def run_cmd(args):
+    r = subprocess.run(
+        args, capture_output=True, text=True, errors="replace", creationflags=NO_WINDOW
+    )
+    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+
+
+def run_powershell(script):
+    code, out, err = run_cmd(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "PowerShell command failed.")
+    return out
+
+
+def ps_quote(s):
+    return "'" + s.replace("'", "''") + "'"
+
+
+def fmt_size(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def safe_name(name):
+    bad = '<>:"/\\|?*'
+    cleaned = "".join("_" if c in bad else c for c in name).strip(" .")
+    return cleaned or "Game"
+
+
+def volume_info(root_path):
+    """(label, filesystem) of a drive like 'E:\\'."""
+    try:
+        label = ctypes.create_unicode_buffer(261)
+        fs = ctypes.create_unicode_buffer(261)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(
+            ctypes.c_wchar_p(root_path), label, 261, None, None, None, fs, 261
+        )
+        return (label.value, fs.value) if ok else ("", "")
+    except Exception:
+        return ("", "")
+
+
+def list_target_drives():
+    """Removable and external drives, never the Windows drive."""
+    system_drive = os.environ.get("SystemDrive", "C:").upper()
+    drives = []
+    for letter in string.ascii_uppercase:
+        root_path = f"{letter}:\\"
+        if f"{letter}:" == system_drive:
+            continue
+        dtype = ctypes.windll.kernel32.GetDriveTypeW(root_path)
+        if dtype not in (2, 3):  # 2 = removable, 3 = fixed (external SSDs report fixed)
+            continue
+        try:
+            total = shutil.disk_usage(root_path).total
+        except OSError:
+            continue
+        label, fs = volume_info(root_path)
+        kind = "USB" if dtype == 2 else "Disk"
+        text = f"{root_path}  {label or 'No label'}  ({kind}, {fmt_size(total)}, {fs or '?'})"
+        drives.append((text, root_path))
+    return drives
+
+
+# ============================================================== copying
+
+
+def collect_files(src_root, dst_dir, only=None):
+    """List (src, dst, size) to copy. Files already on the target with the same
+    size and date are skipped, so re-running resumes an interrupted copy."""
+    pairs, errors = [], []
+    if only is None:
+        sources = (os.path.join(r, f) for r, _, fs in os.walk(src_root) for f in fs)
+    else:
+        sources = only
+    for s in sources:
+        d = os.path.join(dst_dir, os.path.relpath(s, src_root))
+        try:
+            st = os.stat(s)
+        except OSError as e:
+            errors.append((s, str(e)))
+            continue
+        try:
+            dt = os.stat(d)
+            if dt.st_size == st.st_size and abs(dt.st_mtime - st.st_mtime) <= 2:
+                continue
+        except OSError:
+            pass
+        pairs.append((s, d, st.st_size))
+    return pairs, errors
+
+
+def preflight(target, pairs):
+    total = sum(p[2] for p in pairs)
+    free = shutil.disk_usage(target).free
+    if total > free:
+        raise RuntimeError(
+            f"Not enough space on {target}\nNeeded: {fmt_size(total)}   Free: {fmt_size(free)}"
+        )
+    _, fs = volume_info(target)
+    if fs.upper() == "FAT32":
+        big = [os.path.basename(p[0]) for p in pairs if p[2] > FAT32_MAX_FILE]
+        if big:
+            raise RuntimeError(
+                "This drive is FAT32, which cannot hold files larger than 4 GB:\n  "
+                + "\n  ".join(big[:5])
+                + "\n\nFormat the drive as exFAT or NTFS (right-click it in Explorer > Format) and try again."
+            )
+
+
+def copy_with_progress(pairs, on_progress):
+    done, errors = 0, []
+    for src, dst, _ in pairs:
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(src, "rb") as fi, open(dst, "wb") as fo:
+                while True:
+                    buf = fi.read(CHUNK)
+                    if not buf:
+                        break
+                    fo.write(buf)
+                    done += len(buf)
+                    on_progress(done)
+            shutil.copystat(src, dst)
+        except OSError as e:
+            errors.append((src, str(e)))
+    return errors
+
+
+def error_note(errors):
+    if not errors:
+        return ""
+    s, e = errors[0]
+    return f"\n\n{len(errors)} file(s) could not be copied, e.g.\n{os.path.basename(s)}: {e}"
+
+
+# ============================================================== game detection & graphics
+
+# Real command-line options of each engine. {w}/{h} = resolution.
+ENGINES = {
+    "Unity": {
+        "window": "-screen-fullscreen 0 -screen-width {w} -screen-height {h}",
+        "full": "-screen-fullscreen 1 -screen-width {w} -screen-height {h}",
+        "low": "",
+        "compat": "-force-d3d11",
+    },
+    "Unreal Engine": {
+        "window": "-windowed -ResX={w} -ResY={h}",
+        "full": "-fullscreen -ResX={w} -ResY={h}",
+        "low": '-ExecCmds="Scalability 0"',
+        "compat": "-dx11",
+    },
+    "Source": {
+        "window": "-windowed -w {w} -h {h}",
+        "full": "-fullscreen -w {w} -h {h}",
+        "low": "",
+        "compat": "-dxlevel 90",
+    },
+    "Godot": {
+        "window": "--windowed --resolution {w}x{h}",
+        "full": "--fullscreen --resolution {w}x{h}",
+        "low": "",
+        "compat": "--rendering-driver opengl3",
+    },
+}
+
+GFX_PRESETS = [
+    "Native (game's own settings)",
+    "Auto: full screen at the resolution of the PC it runs on",
+    "Windowed 1280x720",
+    "Windowed 800x600 (very weak PCs)",
+    "Performance: lowest settings + windowed 1280x720",
+]
+
+
+def detect_engine(exe_path, game_dir):
+    exe_dir = os.path.dirname(exe_path)
+    stem = os.path.splitext(os.path.basename(exe_path))[0]
+
+    def has(*p):
+        return os.path.exists(os.path.join(*p))
+
+    if has(exe_dir, "UnityPlayer.dll") or has(exe_dir, stem + "_Data"):
+        return "Unity"
+    if stem.lower().endswith("-shipping") or has(game_dir, "Engine", "Binaries"):
+        return "Unreal Engine"
+    if has(exe_dir, "bin", "engine.dll"):
+        return "Source"
+    if has(exe_dir, stem + ".pck"):
+        return "Godot"
+    return "Unknown"
+
+
+def build_gfx_args(engine, preset, compat, res_vars=("%W%", "%H%")):
+    """Return (arguments, needs_screen_detection).
+    res_vars: how the launcher refers to the detected width/height
+    (%W%/%H% in a Windows .bat, ${W}/${H} in a Linux .sh)."""
+    t = ENGINES.get(engine)
+    if not t:
+        return "", False
+    parts, auto = [], False
+    if preset == GFX_PRESETS[1]:
+        parts.append(t["full"].format(w=res_vars[0], h=res_vars[1]))
+        auto = True
+    elif preset == GFX_PRESETS[2]:
+        parts.append(t["window"].format(w=1280, h=720))
+    elif preset == GFX_PRESETS[3]:
+        parts.append(t["window"].format(w=800, h=600))
+    elif preset == GFX_PRESETS[4]:
+        parts.append(t["window"].format(w=1280, h=720))
+        parts.append(t["low"])
+    if compat:
+        parts.append(t["compat"])
+    return " ".join(p for p in parts if p), auto
+
+
+SKIP_EXE = ("unins", "crash", "setup", "redist", "dxsetup", "dotnet", "prereq",
+            "report", "installer", "updater", "helper")
+SKIP_DIRS = {"_commonredist", "redist", "directx", "__installer", "support", "prereqs"}
+
+
+def find_exes(folder, max_depth=3):
+    folder = os.path.normpath(folder)
+    base = folder.count(os.sep)
+    found = []
+    for r, dirs, files in os.walk(folder):
+        if r.count(os.sep) - base >= max_depth - 1:
+            dirs[:] = []
+        dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
+        for f in files:
+            fl = f.lower()
+            if fl.endswith(".exe") and not any(s in fl for s in SKIP_EXE):
+                found.append(os.path.relpath(os.path.join(r, f), folder))
+    return found
+
+
+def pick_best_exe(folder, exes):
+    if not exes:
+        return ""
+    name = os.path.basename(os.path.normpath(folder)).lower().replace(" ", "")
+
+    def score(rel):
+        stem = os.path.splitext(os.path.basename(rel))[0].lower().replace(" ", "")
+        s = -2 * rel.count(os.sep)
+        if stem and (stem in name or name in stem):
+            s += 5
+        if "launcher" in stem:
+            s -= 1
+        return s
+
+    return max(exes, key=score)
+
+
+LIBRARY_SUBDIRS = (
+    "Program Files (x86)\\Steam\\steamapps\\common",
+    "Program Files\\Steam\\steamapps\\common",
+    "SteamLibrary\\steamapps\\common",
+    "Steam\\steamapps\\common",
+    "Program Files\\Epic Games",
+    "Epic Games",
+    "Program Files (x86)\\GOG Galaxy\\Games",
+    "GOG Games",
+    "Program Files\\EA Games",
+    "Games",
+)
+
+
+def scan_libraries():
+    found = []
+    for letter in string.ascii_uppercase:
+        for sub in LIBRARY_SUBDIRS:
+            base = f"{letter}:\\{sub}"
+            if not os.path.isdir(base):
+                continue
+            try:
+                entries = list(os.scandir(base))
+            except OSError:
+                continue
+            for e in entries:
+                if e.is_dir() and find_exes(e.path, max_depth=3):
+                    found.append(e.path)
+    return sorted(set(found), key=lambda p: os.path.basename(p).lower())
+
+
+# ============================================================== launchers
+
+SCREEN_QUERY = (
+    'powershell -NoProfile -Command "$v = Get-CimInstance Win32_VideoController | '
+    "Where-Object { $_.CurrentHorizontalResolution } | Select-Object -First 1; "
+    "[string]$v.CurrentHorizontalResolution + ' ' + [string]$v.CurrentVerticalResolution\""
+)
+
+
+def bat(s):
+    return s.replace("%", "%%")
+
+
+def write_launcher(path, workdir_rel, command, auto_res=False, note=""):
+    lines = ["@echo off", "chcp 65001 >nul", f"rem Blue Pen launcher - {bat(note)}"]
+    if auto_res:
+        lines += [
+            "rem Detect the screen resolution of the PC this runs on",
+            'set "W=1280"',
+            'set "H=720"',
+            f'for /f "usebackq tokens=1,2" %%a in (`{SCREEN_QUERY}`) do (',
+            '  set "W=%%a"',
+            '  set "H=%%b"',
+            ")",
+        ]
+    workdir = bat(workdir_rel).rstrip("\\")
+    lines += [
+        f'cd /d "%~dp0{workdir}" || (echo Folder not found: {workdir} & pause & exit /b 1)',
+        f'start "" {command}',
+    ]
+    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+PLAY_ON = [
+    "Windows PC",
+    "Linux PC (runs with Wine / Proton)",
+    "Both Windows and Linux",
+]
+
+WINE_HELP = ("Could not download Proton automatically (no internet, or Python 3.10+ missing),\\n"
+             "and Wine is not installed. Connect to the internet and try again, or install Wine:\\n"
+             "  Ubuntu / Mint / Debian:  sudo apt install wine\\n"
+             "  Fedora:                  sudo dnf install wine\\n"
+             "  Arch / SteamOS:          sudo pacman -S wine")
+
+UMU_FALLBACK_TAG = "1.4.4"
+
+# Shell functions shared by every Linux launcher.
+# On first run they download umu-launcher (a small Python program from the
+# Open-Wine-Components project); umu then downloads GE-Proton and the Steam Runtime
+# by itself. Everything goes into the user's home folder: no password needed.
+LINUX_BOOTSTRAP = [
+    'BP_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/bluepen"',
+    'UMU=""',
+    "say() {",
+    '  echo "$1"',
+    '  command -v notify-send >/dev/null 2>&1 && notify-send "Blue Pen" "$1"',
+    "  return 0",
+    "}",
+    "fetch() {",
+    "  if command -v curl >/dev/null 2>&1; then curl -fsSL -o \"$2\" \"$1\"",
+    "  elif command -v wget >/dev/null 2>&1; then wget -qO \"$2\" \"$1\"",
+    "  else return 1; fi",
+    "}",
+    "find_umu() {",
+    "  if command -v umu-run >/dev/null 2>&1; then UMU=umu-run; return 0; fi",
+    '  if [ -x "$BP_HOME/umu/umu-run" ]; then UMU="$BP_HOME/umu/umu-run"; return 0; fi',
+    "  return 1",
+    "}",
+    "install_umu() {",
+    "  # umu-launcher needs Python 3.10 or newer",
+    "  python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null || return 1",
+    '  say "First run: downloading Proton to play Windows games (about 1 GB, only once)..."',
+    '  REPO="https://github.com/Open-Wine-Components/umu-launcher"',
+    '  TAG=""',
+    "  if command -v curl >/dev/null 2>&1; then",
+    "    TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \"$REPO/releases/latest\" 2>/dev/null)",
+    '    TAG="${TAG##*/}"',
+    "  fi",
+    f'  case "$TAG" in ""|latest|releases) TAG="{UMU_FALLBACK_TAG}";; esac',
+    '  TMP="$(mktemp -d)"',
+    '  if ! fetch "$REPO/releases/download/$TAG/umu-launcher-$TAG-zipapp.tar" "$TMP/umu.tar"; then',
+    f'    if [ "$TAG" = "{UMU_FALLBACK_TAG}" ] || ! fetch "$REPO/releases/download/{UMU_FALLBACK_TAG}/umu-launcher-{UMU_FALLBACK_TAG}-zipapp.tar" "$TMP/umu.tar"; then',
+    '      rm -rf "$TMP"; return 1',
+    "    fi",
+    "  fi",
+    '  tar -xf "$TMP/umu.tar" -C "$TMP" || { rm -rf "$TMP"; return 1; }',
+    '  F="$(find "$TMP" -type f -name umu-run | head -n 1)"',
+    '  if [ -z "$F" ]; then rm -rf "$TMP"; return 1; fi',
+    '  mkdir -p "$BP_HOME/umu"',
+    '  cp -r "$(dirname "$F")"/. "$BP_HOME/umu/"',
+    '  chmod +x "$BP_HOME/umu/umu-run"',
+    '  rm -rf "$TMP"',
+    '  UMU="$BP_HOME/umu/umu-run"',
+    '  say "Proton is being set up. The game starts in a few minutes, after the download."',
+    "  return 0",
+    "}",
+]
+
+
+def sh_dq(s):
+    """Escape text for use inside double quotes in a shell script."""
+    s = s.replace("\\", "/")
+    for ch in ('"', "$", "`"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def write_linux_launcher(path, workdir_rel, exe, args, auto_res=False, prefix_id="game", note=""):
+    """Linux launcher: runs the Windows .exe with Proton (umu-run) if installed, otherwise Wine."""
+    workdir = sh_dq(workdir_rel).rstrip("/")
+    exe_q = sh_dq(exe)
+    lines = [
+        "#!/usr/bin/env bash",
+        f"# Blue Pen launcher for Linux - {note.replace(chr(10), ' ')}",
+        "# Runs the Windows game with Proton (umu-run) if installed, otherwise with Wine.",
+        'HERE="$(dirname "$(readlink -f "$0")")"',
+        f'cd "$HERE/{workdir}" || {{ echo "Folder not found: {workdir}"; read -r _; exit 1; }}',
+    ]
+    if auto_res:
+        lines += [
+            "# Detect the screen resolution of the PC this runs on",
+            "W=1280; H=720",
+            "if command -v xrandr >/dev/null 2>&1; then",
+            "  RES=$(xrandr --current 2>/dev/null | awk '/\\*/ {print $1; exit}')",
+            '  case "$RES" in *x*) W="${RES%x*}"; H="${RES#*x}";; esac',
+            "fi",
+        ]
+    lines += LINUX_BOOTSTRAP + [
+        "# The Wine prefix lives in your home folder: USB file systems can't hold one.",
+        f'BASE="$BP_HOME/{sh_dq(prefix_id)}"',
+        "if find_umu || install_umu; then",
+        '  export WINEPREFIX="$BASE-proton" GAMEID=umu-default PROTONPATH="${PROTONPATH:-GE-Proton}"',
+        '  mkdir -p "$WINEPREFIX"',
+        f'  exec "$UMU" "{exe_q}" {args}'.rstrip(),
+        "elif command -v wine >/dev/null 2>&1; then",
+        '  export WINEPREFIX="$BASE-wine"',
+        '  mkdir -p "$WINEPREFIX"',
+        f'  exec wine "{exe_q}" {args}'.rstrip(),
+        "fi",
+        f'MSG="{WINE_HELP}"',
+        "if command -v zenity >/dev/null 2>&1; then zenity --error --no-wrap --text=\"$(printf '%b' \"$MSG\")\";",
+        "elif command -v kdialog >/dev/null 2>&1; then kdialog --error \"$(printf '%b' \"$MSG\")\";",
+        "else printf '%b\\n' \"$MSG\"; read -r _; fi",
+        "exit 1",
+    ]
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        pass
+
+
+def write_autorun(target, icon_ref):
+    """Windows ignores 'open=' on USB drives since Windows 7, so only the icon and label are set."""
+    path = os.path.join(target, "autorun.inf")
+    try:
+        if os.path.exists(path):
+            os.chmod(path, 0o666)
+        with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write(f"[autorun]\nicon={icon_ref}\nlabel=BluePen\n")
+    except OSError:
+        pass
+
+
+# ============================================================== console games
+
+EMULATORS = {
+    "PlayStation 1 (DuckStation)": dict(
+        short="PS1", hints=("duckstation",), games="*.cue *.chd *.pbp *.m3u *.iso *.bin",
+        args='-batch{fs} -- "{game}"', fs=" -fullscreen",
+        portable=("portable.txt",), bios="bios"),
+    "PlayStation 2 (PCSX2)": dict(
+        short="PS2", hints=("pcsx2",), games="*.iso *.chd *.cso *.gz *.bin",
+        args='-batch{fs} -- "{game}"', fs=" -fullscreen",
+        portable=("portable.ini", "portable.txt"), bios="bios"),
+    "PlayStation 3 (RPCS3)": dict(
+        short="PS3", hints=("rpcs3",), games="EBOOT.BIN",
+        args='--no-gui "{game}"', fs="",
+        portable=(), bios=None),
+    "Xbox 360 (Xenia)": dict(
+        short="X360", hints=("xenia",), games="*.iso *.xex *.zar",
+        args='{fs}"{game}"', fs="--fullscreen=true ",
+        portable=("portable.txt",), bios=None),
+}
+
+
+def find_emulator_exe(emu_dir, system):
+    hints = EMULATORS[system]["hints"]
+    exes = [e for e in find_exes(emu_dir, max_depth=1)
+            if any(h in e.lower() for h in hints)]
+    return sorted(exes, key=len)
+
+
+def cue_files(cue):
+    folder = os.path.dirname(cue)
+    out = []
+    try:
+        with open(cue, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if s.upper().startswith("FILE "):
+                    rest = s[5:].strip()
+                    if rest.startswith('"') and '"' in rest[1:]:
+                        name = rest[1:rest.index('"', 1)]
+                    else:
+                        name = rest.rsplit(" ", 1)[0]
+                    out.append(os.path.join(folder, name))
+    except OSError:
+        pass
+    return out
+
+
+def game_payload(game_path):
+    """Return (root_folder, files). files=None means copy the whole root folder."""
+    game_path = os.path.normpath(game_path)
+    name = os.path.basename(game_path).lower()
+    parts = game_path.split(os.sep)
+    upper = [p.upper() for p in parts]
+    if name == "eboot.bin" and "PS3_GAME" in upper:
+        return os.sep.join(parts[:upper.index("PS3_GAME")]), None
+    if name.endswith(".xex"):
+        return os.path.dirname(game_path), None
+
+    files = {game_path}
+    if name.endswith(".cue"):
+        files.update(cue_files(game_path))
+    elif name.endswith(".m3u"):
+        folder = os.path.dirname(game_path)
+        with open(game_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    disc = os.path.join(folder, s)
+                    files.add(disc)
+                    if disc.lower().endswith(".cue"):
+                        files.update(cue_files(disc))
+    return os.path.dirname(game_path), sorted(f for f in files if os.path.isfile(f))
+
+
+# ============================================================== bootable USB & ISO
+
+DISK_INFO_PS = r"""
+$ErrorActionPreference = 'Stop'
+$d = Get-Partition -DriveLetter __L__ | Get-Disk
+[pscustomobject]@{Number=$d.Number; Name=$d.FriendlyName; Size=$d.Size; Bus=[string]$d.BusType; IsBoot=$d.IsBoot; IsSystem=$d.IsSystem} | ConvertTo-Json -Compress
+"""
+
+MOUNT_PS = r"""
+$ErrorActionPreference = 'Stop'
+$p = __P__
+$mine = $false
+if (-not (Get-DiskImage -ImagePath $p).Attached) { Mount-DiskImage -ImagePath $p | Out-Null; $mine = $true }
+$l = $null
+for ($i = 0; $i -lt 30 -and -not $l; $i++) {
+  $l = (Get-DiskImage -ImagePath $p | Get-Volume).DriveLetter
+  if (-not $l) { Start-Sleep -Milliseconds 300 }
+}
+if (-not $l) { throw 'The ISO was opened but Windows gave it no drive letter.' }
+"$l $mine"
+"""
+
+FORMAT_PS = r"""
+$ErrorActionPreference = 'Stop'
+$n = __N__
+if ((Get-Disk -Number $n).PartitionStyle -ne 'RAW') { Clear-Disk -Number $n -RemoveData -RemoveOEM -Confirm:$false }
+$d = Get-Disk -Number $n
+if ($d.PartitionStyle -eq 'RAW') { Initialize-Disk -Number $n -PartitionStyle MBR }
+elseif ($d.PartitionStyle -ne 'MBR') { Set-Disk -Number $n -PartitionStyle MBR }
+if ($d.Size -le 32GB) { $p = New-Partition -DiskNumber $n -UseMaximumSize -IsActive -DriveLetter __L__ }
+else { $p = New-Partition -DiskNumber $n -Size 32GB -IsActive -DriveLetter __L__ }
+Format-Volume -Partition $p -FileSystem FAT32 -NewFileSystemLabel 'BLUEPEN' -Confirm:$false | Out-Null
+"""
+
+
+def mount_iso(iso):
+    out = run_powershell(MOUNT_PS.replace("__P__", ps_quote(iso)))
+    letter, mine = out.split()[-2:]
+    return mine.lower() == "true", f"{letter}:\\"
+
+
+def unmount_iso(iso):
+    try:
+        run_powershell(f"Dismount-DiskImage -ImagePath {ps_quote(iso)} | Out-Null")
+    except Exception:
+        pass
+
+
+def iso_is_bootable(path):
+    """Look for an El Torito boot record (what makes a CD/DVD/ISO bootable)."""
+    try:
+        with open(path, "rb") as f:
+            for sector in range(16, 32):
+                f.seek(sector * 2048)
+                d = f.read(2048)
+                if len(d) < 30 or d[1:6] != b"CD001":
+                    break
+                if d[0] == 0 and d[7:16] == b"EL TORITO":
+                    return True
+                if d[0] == 255:
+                    break
+    except OSError:
+        return None
+    return False
+
+
+# ============================================================== UI plumbing
+
+ui_q = queue.Queue()
+busy = False
+action_buttons = []
+drive_map = {}
+
+
+def ui(fn, *a):
+    ui_q.put((fn, a))
+
+
+def poll_ui():
+    try:
+        while True:
+            fn, a = ui_q.get_nowait()
+            fn(*a)
+    except queue.Empty:
+        pass
+    root.after(50, poll_ui)
+
+
+def set_status(text, color="blue"):
+    lbl_status.config(text=text, fg=color)
+
+
+def set_progress(value):
+    progress_bar["value"] = value
+
+
+def make_progress(total):
+    last = [-1]
+
+    def cb(done):
+        pct = int(done * 100 / total) if total else 100
+        if pct != last[0]:
+            last[0] = pct
+            ui(set_progress, pct)
+
+    return cb
+
+
+def set_busy(flag):
+    global busy
+    busy = flag
+    for b in action_buttons:
+        b.config(state="disabled" if flag else "normal")
+
+
+def finish(ok, message):
+    set_busy(False)
+    if ok:
+        set_progress(100)
+        set_status("Done.", "green")
+        messagebox.showinfo("Blue Pen", message)
+    else:
+        set_status("Failed.", "red")
+        messagebox.showerror("Blue Pen", message)
+    refresh_drives(keep=True)
+
+
+def start_thread(fn, *args):
+    def worker():
+        try:
+            fn(*args)
+        except Exception as e:
+            ui(finish, False, str(e))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def run_task(fn, *args):
+    if busy:
+        return
+    set_busy(True)
+    set_progress(0)
+    start_thread(fn, *args)
+
+
+def set_entry(e, value):
+    e.delete(0, tk.END)
+    e.insert(0, value)
+
+
+def browse_dir(entry, title, after=None):
+    p = filedialog.askdirectory(title=title)
+    if p:
+        set_entry(entry, os.path.normpath(p))
+        if after:
+            after()
+
+
+def browse_file(entry, title, types, after=None):
+    p = filedialog.askopenfilename(title=title, filetypes=types)
+    if p:
+        set_entry(entry, os.path.normpath(p))
+        if after:
+            after()
+
+
+def refresh_drives(keep=False):
+    global drive_map
+    previous = drive_map.get(combo_target.get())
+    drives = list_target_drives()
+    drive_map = dict(drives)
+    combo_target["values"] = list(drive_map)
+    match = [label for label, path in drives if path == previous]
+    if keep and match:
+        combo_target.set(match[0])
+    elif drives:
+        combo_target.current(0)
+    else:
+        combo_target.set("No USB / external drive found")
+
+
+def selected_target():
+    return drive_map.get(combo_target.get())
+
+
+def same_drive(path, target):
+    return os.path.splitdrive(os.path.abspath(path))[0].upper() == target[:2].upper()
+
+
+# ============================================================== PC game tab
+
+
+def scan_for_games():
+    def work():
+        ui(set_status, "Scanning Steam / Epic / GOG / Games folders...")
+        items = scan_libraries()
+        ui(scan_done, items)
+
+    run_task(work)
+
+
+def scan_done(items):
+    set_busy(False)
+    if items:
+        combo_found["values"] = items
+        combo_found.current(0)
+        on_found_selected()
+        set_status(f"Found {len(items)} games.", "green")
+    else:
+        combo_found["values"] = []
+        combo_found.set("Nothing found - pick the folder manually")
+        set_status("No games found automatically.", "gray")
+
+
+def on_found_selected(event=None):
+    path = combo_found.get()
+    if os.path.isdir(path):
+        set_entry(pc_src, path)
+        on_pc_folder()
+
+
+def on_pc_folder():
+    folder = pc_src.get().strip()
+    if not os.path.isdir(folder):
+        return
+    exes = find_exes(folder)
+    pc_exe["values"] = exes
+    pc_exe.set(pick_best_exe(folder, exes))
+    update_engine_label()
+
+
+def update_engine_label(event=None):
+    folder, exe = pc_src.get().strip(), pc_exe.get().strip()
+    path = os.path.join(folder, exe)
+    if not exe or not os.path.isfile(path):
+        lbl_engine.config(text="Engine: -", fg="gray")
+        return
+    engine = detect_engine(path, folder)
+    if engine == "Unknown":
+        lbl_engine.config(
+            text="Engine not recognised: graphics presets can't be applied.\n"
+                 "Use 'Extra arguments' with options from the game's own docs.",
+            fg="#b8860b")
+    else:
+        lbl_engine.config(text=f"Engine: {engine} (graphics presets supported)", fg="green")
+
+
+def start_pc_copy():
+    game_dir = pc_src.get().strip()
+    exe_rel = pc_exe.get().strip()
+    target = selected_target()
+    if not game_dir or not os.path.isdir(game_dir):
+        return messagebox.showerror("Blue Pen", "Pick a valid game folder.")
+    game_dir = os.path.normpath(game_dir)
+    exe_path = os.path.join(game_dir, exe_rel)
+    if not exe_rel or not os.path.isfile(exe_path):
+        return messagebox.showerror("Blue Pen", "Pick the game's .exe (it must be inside the game folder).")
+    if not target:
+        return messagebox.showerror("Blue Pen", "Pick a target USB / external drive.")
+    if same_drive(game_dir, target):
+        return messagebox.showerror("Blue Pen", "The game is already on that drive.")
+
+    engine = detect_engine(exe_path, game_dir)
+    preset = pc_gfx.get()
+    if engine == "Unknown" and (preset != GFX_PRESETS[0] or pc_compat.get()):
+        if not messagebox.askyesno(
+            "Blue Pen",
+            "The game engine wasn't recognised, so the graphics preset can't be applied.\n"
+            "Continue and copy the game without graphics changes?"):
+            return
+    run_task(do_pc_copy, game_dir, exe_rel, target, engine, pc_compat.get(),
+             pc_args.get().strip(), pc_icon.get().strip(), preset, pc_play_on.get())
+
+
+def do_pc_copy(game_dir, exe_rel, target, engine, compat, extra, icon, preset, play_on):
+    name = safe_name(os.path.basename(game_dir))
+    dest = os.path.join(target, name)
+    for_windows = play_on in (PLAY_ON[0], PLAY_ON[2])
+    for_linux = play_on in (PLAY_ON[1], PLAY_ON[2])
+
+    ui(set_status, "Counting files...")
+    pairs, errors = collect_files(game_dir, dest)
+    preflight(target, pairs)
+    ui(set_status, f"Copying {name}...")
+    errors += copy_with_progress(pairs, make_progress(sum(p[2] for p in pairs)))
+
+    workdir = os.path.join(name, os.path.dirname(exe_rel))
+    note_text = f"{name} | engine: {engine} | graphics: {preset}"
+    launchers, args = [], ""
+    if for_windows:
+        gfx, auto = build_gfx_args(engine, preset, compat)
+        args = " ".join(a for a in (gfx, extra) if a)
+        write_launcher(
+            os.path.join(target, f"Play {name}.bat"),
+            workdir_rel=workdir,
+            command=f'"{bat(os.path.basename(exe_rel))}" {args}'.strip(),
+            auto_res=auto,
+            note=note_text,
+        )
+        launchers.append(f"Windows:  Play {name}.bat")
+    if for_linux:
+        gfx, auto = build_gfx_args(engine, preset, compat, res_vars=("${W}", "${H}"))
+        largs = " ".join(a for a in (gfx, extra) if a)
+        args = args or largs
+        write_linux_launcher(
+            os.path.join(target, f"Play {name}.sh"),
+            workdir_rel=workdir,
+            exe=os.path.basename(exe_rel),
+            args=largs,
+            auto_res=auto,
+            prefix_id=name,
+            note=note_text,
+        )
+        launchers.append(f"Linux:    Play {name}.sh")
+
+    if icon and os.path.isfile(icon):
+        shutil.copy2(icon, os.path.join(dest, "icon.ico"))
+        icon_ref = f"{name}\\icon.ico"
+    else:
+        icon_ref = f"{name}\\{exe_rel},0"
+    write_autorun(target, icon_ref)
+
+    with open(os.path.join(dest, "BluePen-info.txt"), "w", encoding="utf-8") as f:
+        f.write(f"Game: {name}\nExecutable: {exe_rel}\nEngine: {engine}\n"
+                f"Graphics preset: {preset}\nPlays on: {play_on}\nArguments: {args or '(none)'}\n")
+        if for_linux:
+            f.write("\nOn Linux:\n"
+                    f"  Double-click 'Play {name}.sh' (or right-click > Run as program).\n"
+                    f"  From a terminal:  bash \"Play {name}.sh\"\n"
+                    "  Needs Wine, or better umu-launcher (Proton). The script tells you how to install them.\n"
+                    "  Steam alternative: Steam > Add a Non-Steam Game > pick the .exe > "
+                    "Properties > Compatibility > force Proton.\n")
+
+    linux_note = ("\n\nOn Linux it runs through Wine/Proton: most games work, "
+                  "but games with anti-cheat may not." if for_linux else "")
+    ui(finish, True,
+       f"{name} is on {target}\n\nTo play, open:\n  " + "\n  ".join(launchers) + "\n\n"
+       f"Engine: {engine}\nArguments: {args or '(none)'}"
+       + linux_note
+       + ("\n\nNote: some games also need Steam/Epic running or their DRM to start." if not errors else "")
+       + error_note(errors))
+
+
+# ============================================================== console tab
+
+
+def on_system_changed(event=None):
+    on_emu_folder()
+
+
+def on_emu_folder():
+    folder = con_emu.get().strip()
+    if not os.path.isdir(folder):
+        con_emu_exe["values"] = []
+        con_emu_exe.set("")
+        return
+    exes = find_emulator_exe(folder, con_system.get())
+    con_emu_exe["values"] = exes
+    con_emu_exe.set(exes[0] if exes else "")
+    if not exes:
+        set_status(f"No {con_system.get()} emulator .exe found in that folder.", "#b8860b")
+
+
+def browse_game_file(entry):
+    spec = EMULATORS[con_system.get()]
+    browse_file(entry, "Select your game file",
+                [(f"{spec['short']} games", spec["games"]), ("All files", "*.*")])
+
+
+def start_console_copy():
+    system = con_system.get()
+    emu_dir = con_emu.get().strip()
+    emu_exe = con_emu_exe.get().strip()
+    game = con_game.get().strip()
+    target = selected_target()
+    if not os.path.isdir(emu_dir) or not emu_exe or not os.path.isfile(os.path.join(emu_dir, emu_exe)):
+        return messagebox.showerror("Blue Pen", f"Pick the folder of the emulator for {system}.")
+    if not os.path.isfile(game):
+        return messagebox.showerror("Blue Pen", "Pick your game file.")
+    if not target:
+        return messagebox.showerror("Blue Pen", "Pick a target USB / external drive.")
+    run_task(do_console_copy, system, os.path.normpath(emu_dir), emu_exe, os.path.normpath(game),
+             con_fullscreen.get(), target)
+
+
+def do_console_copy(system, emu_dir, emu_exe, game, fullscreen, target):
+    spec = EMULATORS[system]
+    emu_name = safe_name(os.path.basename(emu_dir))
+    emu_dest = os.path.join(target, "Emulators", emu_name)
+
+    root_dir, files = game_payload(game)
+    if files is None:
+        folder = safe_name(os.path.basename(root_dir))
+        game_dest = os.path.join(target, "Games", spec["short"], folder)
+        gpairs, gerr = collect_files(root_dir, game_dest)
+        launch_rel = os.path.join("Games", spec["short"], folder, os.path.relpath(game, root_dir))
+    else:
+        game_dest = os.path.join(target, "Games", spec["short"])
+        gpairs, gerr = collect_files(root_dir, game_dest, files)
+        launch_rel = os.path.join("Games", spec["short"], os.path.basename(game))
+
+    ui(set_status, "Counting files...")
+    epairs, eerr = collect_files(emu_dir, emu_dest)
+    pairs = epairs + gpairs
+    preflight(target, pairs)
+    ui(set_status, f"Copying emulator and game...")
+    errors = eerr + gerr + copy_with_progress(pairs, make_progress(sum(p[2] for p in pairs)))
+
+    for marker in spec["portable"]:
+        p = os.path.join(emu_dest, marker)
+        if not os.path.exists(p):
+            open(p, "w").close()
+
+    warnings = []
+    if spec["bios"]:
+        bios = os.path.join(emu_dest, spec["bios"])
+        if not (os.path.isdir(bios) and os.listdir(bios)):
+            warnings.append(f"No BIOS found. Copy your own {spec['short']} BIOS file into:\n  {bios}")
+    if spec["short"] == "PS3" and not os.path.isdir(os.path.join(emu_dest, "dev_flash", "sys")):
+        warnings.append("PS3 firmware isn't installed in this RPCS3 folder. "
+                        "Install it in RPCS3 (File > Install Firmware) and copy again.")
+
+    stem = safe_name(os.path.splitext(os.path.basename(
+        root_dir if files is None else game))[0])
+    args = spec["args"].format(fs=spec["fs"] if fullscreen else "",
+                               game="%~dp0" + bat(launch_rel))
+    launcher_name = f"Play {stem} ({spec['short']}).bat"
+    write_launcher(
+        os.path.join(target, launcher_name),
+        workdir_rel=os.path.join("Emulators", emu_name, os.path.dirname(emu_exe)),
+        command=f'"{bat(os.path.basename(emu_exe))}" {args}',
+        note=f"{system}",
+    )
+
+    ui(finish, True,
+       f"Done. To play on any PC, open:\n  {launcher_name}"
+       + ("\n\n" + "\n\n".join(warnings) if warnings else "")
+       + error_note(errors))
+
+
+# ============================================================== bootable tab
+
+
+def start_bootable():
+    iso = boot_iso.get().strip()
+    target = selected_target()
+    if not iso.lower().endswith(".iso") or not os.path.isfile(iso):
+        return messagebox.showerror("Blue Pen", "Pick a valid .iso file.")
+    if not target:
+        return messagebox.showerror("Blue Pen", "Pick the USB stick to make bootable.")
+    if same_drive(iso, target):
+        return messagebox.showerror("Blue Pen", "The ISO is on the USB that will be erased. Move it first.")
+    if not is_admin():
+        if messagebox.askyesno("Blue Pen", "Making a bootable USB needs administrator rights.\n"
+                                           "Restart Blue Pen as administrator?"):
+            if relaunch_as_admin():
+                root.destroy()
+        return
+    run_task(bootable_prepare, os.path.abspath(iso), target)
+
+
+def bootable_prepare(iso, target):
+    ui(set_status, "Checking the USB drive...")
+    info = json.loads(run_powershell(DISK_INFO_PS.replace("__L__", target[0])))
+    if info["IsBoot"] or info["IsSystem"]:
+        raise RuntimeError("That drive holds Windows. Refusing to erase it.")
+    if info["Bus"].upper() != "USB":
+        raise RuntimeError(f"{target} is not a USB drive (bus: {info['Bus']}).\n"
+                           "For safety, Blue Pen only erases USB drives.")
+
+    ui(set_status, "Opening the ISO...")
+    mine, src = mount_iso(iso)
+    try:
+        files, total, big = [], 0, []
+        for r, _, fs in os.walk(src):
+            for f in fs:
+                p = os.path.join(r, f)
+                size = os.path.getsize(p)
+                rel = os.path.relpath(p, src)
+                files.append((p, rel, size))
+                total += size
+                if size > FAT32_MAX_FILE:
+                    big.append(rel)
+        wim = os.path.join("sources", "install.wim").lower()
+        split = any(b.lower() == wim for b in big)
+        other_big = [b for b in big if b.lower() != wim]
+        if other_big:
+            raise RuntimeError("This ISO contains files over 4 GB that FAT32 can't hold:\n  "
+                               + "\n  ".join(other_big[:5]))
+        usable = min(info["Size"], 32 * 1024**3)
+        if total + 64 * 1024**2 > usable:
+            raise RuntimeError(f"The USB is too small. Needed: {fmt_size(total)}, usable: {fmt_size(usable)}")
+        has_efi = os.path.isfile(os.path.join(src, "efi", "boot", "bootx64.efi"))
+    except Exception:
+        if mine:
+            unmount_iso(iso)
+        raise
+    ui(bootable_confirm, dict(iso=iso, target=target, info=info, mine=mine, src=src,
+                              files=files, split=split, has_efi=has_efi, wim=wim))
+
+
+def bootable_confirm(job):
+    info = job["info"]
+    msg = (f"ALL DATA on this USB will be ERASED:\n\n  {info['Name']}  ({fmt_size(info['Size'])})"
+           f"  -  {job['target']}\n\n"
+           "It will be formatted FAT32 and made UEFI-bootable.")
+    if info["Size"] > 32 * 1024**3:
+        msg += "\n(Windows can only format 32 GB as FAT32, so a 32 GB partition will be used.)"
+    if job["split"]:
+        msg += "\n\nWindows ISO detected: install.wim will be split to fit FAT32."
+    if not job["has_efi"]:
+        msg += "\n\nWARNING: this ISO has no UEFI boot file (efi\\boot\\bootx64.efi). The USB may not boot."
+    if messagebox.askyesno("Erase USB?", msg + "\n\nContinue?", icon="warning"):
+        start_thread(bootable_write, job)
+    else:
+        if job["mine"]:
+            threading.Thread(target=unmount_iso, args=(job["iso"],), daemon=True).start()
+        set_busy(False)
+        set_status("Cancelled.", "gray")
+
+
+def bootable_write(job):
+    target, src = job["target"], job["src"]
+    try:
+        ui(set_status, f"Erasing and formatting {target}...")
+        run_powershell(FORMAT_PS.replace("__N__", str(job["info"]["Number"]))
+                       .replace("__L__", target[0]))
+        pairs = [(s, os.path.join(target, rel), size) for s, rel, size in job["files"]
+                 if not (job["split"] and rel.lower() == job["wim"])]
+        ui(set_status, "Copying boot and setup files...")
+        errors = copy_with_progress(pairs, make_progress(sum(p[2] for p in pairs)))
+        if errors:
+            raise RuntimeError("Copy failed, the USB is not usable." + error_note(errors))
+        if job["split"]:
+            ui(set_status, "Splitting install.wim for FAT32 (can take 10+ minutes)...")
+            code, out, err = run_cmd([
+                "dism", "/Split-Image",
+                f"/ImageFile:{os.path.join(src, 'sources', 'install.wim')}",
+                f"/SWMFile:{os.path.join(target, 'sources', 'install.swm')}",
+                "/FileSize:3800"])
+            if code != 0:
+                raise RuntimeError("DISM failed:\n" + (out or err)[-800:])
+    finally:
+        if job["mine"]:
+            unmount_iso(job["iso"])
+    ui(finish, True,
+       f"Bootable USB ready on {target}\n\nBoot the PC from it with the boot menu key "
+       "(usually F12, F11, F8 or Esc). It boots in UEFI mode.")
+
+
+# ============================================================== burn tab
+
+
+def on_burn_iso():
+    iso = burn_iso.get().strip()
+    if not os.path.isfile(iso):
+        lbl_iso_boot.config(text="", fg="gray")
+        return
+    b = iso_is_bootable(iso)
+    if b:
+        lbl_iso_boot.config(text="This ISO is bootable: the burned disc will boot.", fg="green")
+    elif b is False:
+        lbl_iso_boot.config(text="No boot record found: the disc will hold the files but won't boot.",
+                            fg="#b8860b")
+    else:
+        lbl_iso_boot.config(text="Couldn't read the ISO.", fg="red")
+
+
+def burn_disc():
+    iso = burn_iso.get().strip()
+    if not iso.lower().endswith(".iso") or not os.path.isfile(iso):
+        return messagebox.showerror("Blue Pen", "Pick a valid .iso file.")
+    tool = os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "isoburn.exe")
+    if not os.path.isfile(tool):
+        return messagebox.showerror("Blue Pen", "The Windows disc burner (isoburn.exe) isn't available.")
+    subprocess.Popen([tool, iso])
+    set_status("Windows Disc Image Burner opened.", "green")
+
+
+# ============================================================== GUI
+
+
+def path_row(parent, label, on_browse):
+    ttk.Label(parent, text=label).pack(anchor="w", pady=(8, 0))
+    fr = ttk.Frame(parent)
+    fr.pack(fill="x")
+    e = ttk.Entry(fr)
+    e.pack(side="left", fill="x", expand=True)
+    ttk.Button(fr, text="...", width=4, command=lambda: on_browse(e)).pack(side="left", padx=(4, 0))
+    return e
+
+
+def action_button(parent, text, cmd):
+    b = ttk.Button(parent, text=text, command=cmd)
+    b.pack(fill="x", pady=(14, 0), ipady=4)
+    action_buttons.append(b)
+    return b
+
+
+def note(parent, text, color="gray"):
+    lbl = tk.Label(parent, text=text, fg=color, justify="left", wraplength=500, anchor="w")
+    lbl.pack(fill="x", pady=(6, 0))
+    return lbl
+
+
+def compile_exe():
+    print("Building BluePen.exe with PyInstaller...")
+    try:
+        import PyInstaller.__main__
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
+        import PyInstaller.__main__
+    PyInstaller.__main__.run(["--onefile", "--noconsole", "--name=BluePen", os.path.abspath(__file__)])
+    print("Done. Look in the 'dist' folder.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--compile":
+        compile_exe()
+        sys.exit()
+    if not IS_WINDOWS:
+        sys.exit("Blue Pen works on Windows only.")
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+    root = tk.Tk()
+    root.title("Blue Pen" + ("  (Administrator)" if is_admin() else ""))
+    root.geometry("580x700")
+    root.minsize(520, 660)
+
+    top = ttk.Frame(root, padding=(12, 10, 12, 0))
+    top.pack(fill="x")
+    ttk.Label(top, text="Target USB / external drive:").pack(anchor="w")
+    fr = ttk.Frame(top)
+    fr.pack(fill="x")
+    combo_target = ttk.Combobox(fr, state="readonly")
+    combo_target.pack(side="left", fill="x", expand=True)
+    ttk.Button(fr, text="Refresh", command=refresh_drives).pack(side="left", padx=(4, 0))
+
+    nb = ttk.Notebook(root)
+    nb.pack(fill="both", expand=True, padx=12, pady=10)
+
+    # ---- PC game
+    tab = ttk.Frame(nb, padding=10)
+    nb.add(tab, text="PC Game")
+    btn_scan = ttk.Button(tab, text="Find installed games (Steam, Epic, GOG, Games folders)",
+                          command=scan_for_games)
+    btn_scan.pack(fill="x")
+    action_buttons.append(btn_scan)
+    combo_found = ttk.Combobox(tab, state="readonly")
+    combo_found.pack(fill="x", pady=(4, 0))
+    combo_found.set("Click the button above, or pick a folder below")
+    combo_found.bind("<<ComboboxSelected>>", on_found_selected)
+
+    pc_src = path_row(tab, "Game folder:", lambda e: browse_dir(e, "Select game folder", on_pc_folder))
+    ttk.Label(tab, text="Game executable:").pack(anchor="w", pady=(8, 0))
+    pc_exe = ttk.Combobox(tab)
+    pc_exe.pack(fill="x")
+    pc_exe.bind("<<ComboboxSelected>>", update_engine_label)
+    pc_exe.bind("<FocusOut>", update_engine_label)
+    lbl_engine = note(tab, "Engine: -")
+
+    ttk.Label(tab, text="Play on:").pack(anchor="w", pady=(8, 0))
+    pc_play_on = ttk.Combobox(tab, values=PLAY_ON, state="readonly")
+    pc_play_on.pack(fill="x")
+    pc_play_on.current(0)
+
+    ttk.Label(tab, text="Graphics:").pack(anchor="w", pady=(8, 0))
+    pc_gfx = ttk.Combobox(tab, values=GFX_PRESETS, state="readonly")
+    pc_gfx.pack(fill="x")
+    pc_gfx.current(0)
+    pc_compat = tk.BooleanVar(value=False)
+    ttk.Checkbutton(tab, text="Compatibility renderer (DirectX 11 / OpenGL) for older graphics cards",
+                    variable=pc_compat).pack(anchor="w", pady=(4, 0))
+
+    pc_icon = path_row(tab, "Drive icon .ico (optional):",
+                       lambda e: browse_file(e, "Select icon", [("Icon", "*.ico")]))
+    ttk.Label(tab, text="Extra arguments (optional):").pack(anchor="w", pady=(8, 0))
+    pc_args = ttk.Entry(tab)
+    pc_args.pack(fill="x")
+    action_button(tab, "Copy game to USB", start_pc_copy)
+
+    # ---- Console
+    tab = ttk.Frame(nb, padding=10)
+    nb.add(tab, text="Console (Emulator)")
+    note(tab, "Puts a console game on the USB together with a portable emulator, so it "
+              "plays on any Windows PC. Use your own game dumps and BIOS.")
+    ttk.Label(tab, text="Console:").pack(anchor="w", pady=(8, 0))
+    con_system = ttk.Combobox(tab, values=list(EMULATORS), state="readonly")
+    con_system.pack(fill="x")
+    con_system.current(1)
+    con_system.bind("<<ComboboxSelected>>", on_system_changed)
+    con_emu = path_row(tab, "Emulator folder (portable version recommended):",
+                       lambda e: browse_dir(e, "Select emulator folder", on_emu_folder))
+    ttk.Label(tab, text="Emulator executable:").pack(anchor="w", pady=(8, 0))
+    con_emu_exe = ttk.Combobox(tab)
+    con_emu_exe.pack(fill="x")
+    con_game = path_row(tab, "Game file (PS3: EBOOT.BIN inside PS3_GAME\\USRDIR):", browse_game_file)
+    con_fullscreen = tk.BooleanVar(value=True)
+    ttk.Checkbutton(tab, text="Start in full screen", variable=con_fullscreen).pack(anchor="w", pady=(6, 0))
+    note(tab, "PS4, PS5 and Xbox One/Series aren't offered: there is no emulator that runs them reliably.")
+    action_button(tab, "Copy emulator + game to USB", start_console_copy)
+
+    # ---- Bootable
+    tab = ttk.Frame(nb, padding=10)
+    nb.add(tab, text="Bootable USB")
+    note(tab, "Makes a real UEFI-bootable USB from an ISO (Windows 10/11 installer, Linux, rescue disks). "
+              "Large Windows images are split automatically to fit FAT32.\n\n"
+              "The whole USB stick is ERASED. Needs administrator rights.", "#333")
+    boot_iso = path_row(tab, "ISO file:", lambda e: browse_file(e, "Select ISO", [("ISO image", "*.iso")]))
+    action_button(tab, "Create bootable USB (erases the drive)", start_bootable)
+
+    # ---- Burn
+    tab = ttk.Frame(nb, padding=10)
+    nb.add(tab, text="Burn Disc")
+    burn_iso = path_row(tab, "ISO file:",
+                        lambda e: browse_file(e, "Select ISO", [("ISO image", "*.iso")], on_burn_iso))
+    lbl_iso_boot = note(tab, "")
+    note(tab, "Whether a disc boots depends only on the ISO itself; Blue Pen tells you above.")
+    action_button(tab, "Open Windows Disc Burner", burn_disc)
+
+    # ---- Progress
+    bottom = ttk.Frame(root, padding=(12, 0, 12, 10))
+    bottom.pack(fill="x")
+    progress_bar = ttk.Progressbar(bottom, mode="determinate", maximum=100)
+    progress_bar.pack(fill="x")
+    lbl_status = tk.Label(bottom, text="Ready.", fg="gray", anchor="w")
+    lbl_status.pack(fill="x", pady=(4, 0))
+
+    refresh_drives()
+    root.after(50, poll_ui)
+    root.mainloop()
